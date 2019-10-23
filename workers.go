@@ -5,7 +5,10 @@
 
 package workers
 
-import "fmt"
+import (
+	"fmt"
+	"sync/atomic"
+)
 
 //  首先定义一个job的接口，只要实现了Do这个接口，就可以用Job表示
 type Job interface {
@@ -13,26 +16,33 @@ type Job interface {
 }
 
 // 定义job队列(每个worker一个，用来接收Job的)
-type JobChan chan Job
+type jobChan chan Job
 
 // 全局Job队列 所有job都先入此队列
-var thisJobQueue JobChan
+var thisJobQueue jobChan
+
+var waitJob uint64 = 0 //等待被处理的job数
+var doneJob uint64 = 0 //已处理的job数
 
 // 每个worker都有一个job队列，在启动worker的时候会被注册到workerpool中
 // 启动后通过自身的job队列取到job并执行job。
 type worker struct {
+	Index uint32 //worker的唯一索引
 	//WorkerPool是一个全局变量，装载(维护)了每个worker的JobChannel（每个worker接收job的队列）
-	WorkerPool chan JobChan
+	WorkerPool chan jobChan
 	//每个worker自身都维持一个jobchan队列，通过此队列来接收job
-	JobChannel JobChan
+	JobChannel jobChan
+	DoneJob    uint64 //本worker已处理的job
 	quit       chan bool
 }
 
-func newWorker(pool chan JobChan) *worker {
+func newWorker(index uint32, pool chan jobChan) *worker {
 	return &worker{
+		Index:      index,
 		WorkerPool: pool,
-		JobChannel: make(JobChan),
+		JobChannel: make(jobChan),
 		quit:       make(chan bool),
+		DoneJob:    0,
 	}
 }
 
@@ -45,9 +55,12 @@ func (w *worker) Start() {
 			w.WorkerPool <- w.JobChannel
 			select {
 			case job := <-w.JobChannel:
+				atomic.AddUint64(&waitJob, ^uint64(1-1))
 				if err := job.Do(); err != nil {
 					fmt.Printf("execute job failed with err: %v", err)
 				}
+				atomic.AddUint64(&w.DoneJob, 1)
+				atomic.AddUint64(&doneJob, 1)
 			case <-w.quit:
 				return
 			}
@@ -63,23 +76,23 @@ func (w *worker) Stop() {
 
 //分发器，可以统计多项数据
 type Dispatcher struct {
-	WorkerPool chan JobChan
+	WorkerPool chan jobChan
 	Workers    []*worker
 	quit       chan bool
 	maxsize    int
 }
 
 //一个dispatcher对应一个总的job队列
-func NewDispatcher(maxworkernum, maxjobqueue int) (*Dispatcher, JobChan) {
+func NewDispatcher(maxworkernum, maxjobqueue int) (*Dispatcher, jobChan) {
 	if maxworkernum <= 0 {
 		maxworkernum = 100 //默认100
 	}
 	if maxjobqueue < maxworkernum {
 		maxjobqueue = maxworkernum
 	}
-	thisJobQueue = make(JobChan, maxjobqueue)
+	thisJobQueue = make(jobChan, maxjobqueue)
 	return &Dispatcher{
-		WorkerPool: make(chan JobChan, maxworkernum),
+		WorkerPool: make(chan jobChan, maxworkernum),
 		Workers:    make([]*worker, 0, maxworkernum),
 		quit:       make(chan bool),
 		maxsize:    maxworkernum,
@@ -88,7 +101,7 @@ func NewDispatcher(maxworkernum, maxjobqueue int) (*Dispatcher, JobChan) {
 
 func (d *Dispatcher) Run() {
 	for i := 0; i < d.maxsize; i++ {
-		worker := newWorker(d.WorkerPool)
+		worker := newWorker(uint32(i), d.WorkerPool)
 		d.Workers = append(d.Workers, worker)
 		worker.Start()
 	}
@@ -99,6 +112,8 @@ func (d *Dispatcher) dispatch() {
 	for {
 		select {
 		case job := <-thisJobQueue:
+			//此处有可能生成无数的goroutine,可在此处进行控制
+			atomic.AddUint64(&waitJob, 1)
 			go func(job Job) {
 				jobChan := <-d.WorkerPool
 				jobChan <- job
@@ -114,4 +129,12 @@ func (d *Dispatcher) Stop() {
 		worker.Stop()
 	}
 	d.quit <- true
+}
+
+func (d *Dispatcher) Stat() (uint64, uint64, uint64) {
+	var sum uint64 = 0
+	for _, worker := range d.Workers {
+		sum += worker.DoneJob
+	}
+	return waitJob, doneJob, sum
 }
