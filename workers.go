@@ -55,7 +55,6 @@ func (w *worker) Start() {
 			w.WorkerPool <- w.JobChannel
 			select {
 			case job := <-w.JobChannel:
-				atomic.AddUint64(&waitJob, ^uint64(1-1))
 				if err := job.Do(); err != nil {
 					fmt.Printf("execute job failed with err: %v", err)
 				}
@@ -113,10 +112,11 @@ func (d *Dispatcher) dispatch() {
 		select {
 		case job := <-thisJobQueue:
 			//此处有可能生成无数的goroutine,可在此处进行控制
-			atomic.AddUint64(&waitJob, 1)
 			go func(job Job) {
+				atomic.AddUint64(&waitJob, 1)
 				jobChan := <-d.WorkerPool
 				jobChan <- job
+				atomic.AddUint64(&waitJob, ^uint64(1-1))
 			}(job)
 		case <-d.quit:
 			return
